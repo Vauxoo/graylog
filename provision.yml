@@ -1,0 +1,122 @@
+- hosts: all
+  become: yes
+  become_user: root
+  vars:
+    - public_ip: 127.0.0.1
+    - api: "{{ api_port | default(12900) }}"
+  tasks:
+
+    - name: Add apt-cacher
+      shell: echo 'Acquire::HTTP::Proxy "http://{{ aptcache }}:3142";' >> /etc/apt/apt.conf.d/01proxy && echo 'Acquire::HTTPS::Proxy "false";' >> /etc/apt/apt.conf.d/01proxy
+      when: aptcache is defined
+
+    - name: Check for the MongoDB repo key
+      apt_key: keyserver=hkp://keyserver.ubuntu.com:80 id=7F0CEB10 state=present
+
+    - name: Check for the MongoDB repo
+      apt_repository: repo='deb http://downloads-distro.mongodb.org/repo/debian-sysvinit dist 10gen' state=present
+
+    - name: Add Openjdk 8 repo
+      apt_repository: repo='ppa:openjdk-r/ppa'
+
+    - name: Check for the Elastic search repo key
+      apt_key: url=https://packages.elastic.co/GPG-KEY-elasticsearch state=present
+
+    - name: Check for the Elastic search repo
+      apt_repository: repo='deb https://packages.elastic.co/elasticsearch/2.x/debian stable main' state=present
+
+    - name: Download Graylog2 repo
+      get_url: url=https://packages.graylog2.org/repo/packages/graylog-2.0-repository_latest.deb dest="/tmp/graylogrepo.deb"
+
+    - name: Install Graylog2 repo
+      apt: deb="/tmp/graylogrepo.deb"
+
+    - name: Update packages list and packages
+      apt: update_cache=yes upgrade=dist
+
+    - name: Check for required packages
+      apt: pkg={{ item }} state=installed
+      with_items:
+        - mongodb-org
+        - openjdk-8-jdk
+        - elasticsearch
+        - pwgen
+        - graylog-server
+        - openvpn
+        - nginx
+
+    - name: Configuring OpenVPN
+      copy: src=log-vauxoo.conf dest=/etc/openvpn/log-vauxoo.conf
+      when: provider == 'amazon'
+
+    - name: Restarting OpenVPN service
+      service: name=openvpn state=restarted
+      when: provider == 'amazon'
+
+
+    - name: Configure Elastic search
+      lineinfile: "dest=/etc/elasticsearch/elasticsearch.yml regexp='^#.?cluster.name.*' line='cluster.name: graylog2' state=present"
+
+    - name: Configure Elastic search
+      lineinfile: "dest=/etc/elasticsearch/elasticsearch.yml regexp='^#.?network.host:.*' line='network.host: 127.0.0.1' state=present"
+
+    - name: Configure Elastic search
+      lineinfile: "dest=/etc/elasticsearch/elasticsearch.yml line='script.inline: off' state=present"
+
+    - name: Restart Elastic search
+      service: name=elasticsearch state=restarted
+
+    - name: Getting VPC public ip
+      shell: ec2metadata | grep public-ipv4 | awk '{print $2}'
+      register: amazon_ip
+      when: provider == 'amazon'
+
+    - name: Public VPC ip
+      debug: msg={{ amazon_ip }}
+      when: provider == 'amazon'
+
+    - name: Generating Graylog2 password
+      command: "pwgen -s 96 1"
+      register: graylog_pass
+
+    - name: Graylog admin pass
+      debug: msg={{ graylog_pass }}
+
+    - name: Calculating sha256
+      shell: echo -n {{ graylog_pass.stdout }} | shasum -a 256 | awk '{print $1}'
+      register: sha_pass
+
+    - name: Configure Graylog2 server
+      lineinfile: "dest=/etc/graylog/server/server.conf regexp='^password_secret.*' line='password_secret = {{ graylog_pass.stdout }}' state=present"
+
+    - name: Configure Graylog2 server
+      lineinfile: "dest=/etc/graylog/server/server.conf regexp='^root_password_sha2.*' line='root_password_sha2 = {{ sha_pass.stdout }}' state=present"
+
+    - name: Configure Graylog2 server
+      lineinfile: dest=/etc/graylog/server/server.conf regexp='^elasticsearch_shards.*' line='elasticsearch_shards = 1' state=present
+
+    - name: Configure Graylog2 server
+      lineinfile: dest=/etc/graylog/server/server.conf regexp='^#web_listen_uri.*' line='web_listen_uri = http://{{ public_ip }}:9000/' state=present
+
+    - name: Configure Graylog2 server
+      lineinfile: dest=/etc/graylog/server/server.conf regexp='^#?rest_listen_uri.*' line='rest_listen_uri = http://0.0.0.0:{{ api }}/' state=present
+
+    - name: Configure Graylog2 server
+      lineinfile: dest=/etc/graylog/server/server.conf regexp='^#rest_transport_uri.*' line='rest_transport_uri = http://{{ amazon_ip.stdout }}:{{ api }}/' state=present
+      when: provider == 'amazon'
+
+    - name: Configure Graylog2 server
+      lineinfile: dest=/etc/graylog/server/server.conf regexp='^#elasticsearch_cluster_name.*' line='elasticsearch_cluster_name = graylog2' state=present
+
+    - name: Configure Graylog2 server
+      lineinfile: dest=/etc/graylog/server/server.conf regexp='^#rest_transport_uri.*' line='rest_transport_uri = http://{{ public_ip }}:{{ api }}/' state=present
+      when: provider == 'virtualbox'
+
+    - name: Restart Graylog2 server
+      service: name=graylog-server state=restarted
+
+    - name: Configure nginx
+      template: src=site-graylog.conf dest=/etc/nginx/sites-enabled/site-graylog.conf
+
+    - name: Restar nginx
+      service: name=nginx state=restarted
